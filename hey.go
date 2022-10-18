@@ -16,8 +16,14 @@
 package main
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"flag"
 	"fmt"
+	"hash"
+	"io"
 	"io/ioutil"
 	"math"
 	"net/http"
@@ -64,6 +70,8 @@ var (
 	disableKeepAlives  = flag.Bool("disable-keepalive", false, "")
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
 	proxyAddr          = flag.String("x", "", "")
+	accessKeyId        = flag.String("access-key-id", "", "")
+	accessKeySecret    = flag.String("access-key-secret", "", "")
 )
 
 var usage = `Usage: hey [options...] <url>
@@ -101,11 +109,13 @@ Options:
   -disable-redirects    Disable following of HTTP redirects
   -cpus                 Number of used cpu cores.
                         (default for current machine is %d cores)
+  -access-key-id        Access key ID.
+  -access-key-secret    Access key secret.
 `
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, fmt.Sprintf(usage, runtime.NumCPU()))
+		fmt.Fprintf(os.Stderr, usage, runtime.NumCPU())
 	}
 
 	var hs headerSlice
@@ -235,6 +245,33 @@ func main() {
 		ProxyAddr:          proxyURL,
 		Output:             *output,
 	}
+	if *accessKeyId != "" && *accessKeySecret != "" {
+		w.RequestFunc = func() *http.Request {
+			r := new(http.Request)
+			*r = *req
+
+			if len(bodyAll) > 0 {
+				r.Body = ioutil.NopCloser(bytes.NewReader(bodyAll))
+			}
+
+			// deep copy of the Header
+			r.Header = make(http.Header, len(req.Header))
+			for k, s := range req.Header {
+				r.Header[k] = append([]string(nil), s...)
+			}
+
+			date := time.Now().UTC().Format(http.TimeFormat)
+			bodySha256 := calcSha256B64(bodyAll)
+			sigStr := fmt.Sprintf("%s\n%s\napplication/json\n%s", r.Method, bodySha256, date)
+			sig := calcHmacSha256B64(sigStr, *accessKeySecret)
+			authorization := fmt.Sprintf("MPC-KMS %s:%s", *accessKeyId, sig)
+			r.Header.Add("Date", date)
+			r.Header.Add("Authorization", authorization)
+			r.Header.Set("Content-Type", "application/json")
+
+			return r
+		}
+	}
 	w.Init()
 
 	c := make(chan os.Signal, 1)
@@ -286,4 +323,19 @@ func (h *headerSlice) String() string {
 func (h *headerSlice) Set(value string) error {
 	*h = append(*h, value)
 	return nil
+}
+
+func calcSha256B64(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	h.Write(b)
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func calcHmacSha256B64(sigStr, sk string) string {
+	h := hmac.New(func() hash.Hash { return sha256.New() }, []byte(sk))
+	io.WriteString(h, sigStr)
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
